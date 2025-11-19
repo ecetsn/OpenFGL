@@ -17,7 +17,7 @@ supported_graph_fl_task = ["graph_cls", "graph_reg"]
 supported_subgraph_fl_task = ["node_cls", "link_pred", "node_clust"]
 
 
-supported_fl_algorithm = ["isolate", "fedavg", "fedprox", "scaffold", "moon", "feddc", "fedproto", "fedtgp", "fedpub", "fedstar", "fedgta", "fedtad", "gcfl_plus", "fedsage_plus", "adafgl", "feddep", "fggp", "fgssl", "fedgl"]
+supported_fl_algorithm = ["isolate", "fedavg", "fedprox", "scaffold", "moon", "feddc", "fedproto", "fedtgp", "fedpub", "fedstar", "fedgta", "fedtad", "gcfl_plus", "fedsage_plus", "adafgl", "feddep", "fggp", "fgssl", "fedgl", "hcfl_plus"]
 
 
 supported_metrics = ["accuracy", "precision", "f1", "recall", "auc", "ap", "clustering_accuracy", "nmi", "ari"]
@@ -60,6 +60,11 @@ parser.add_argument("--num_clients", type=int, default=10)
 parser.add_argument("--num_rounds", type=int, default=100)
 parser.add_argument("--fl_algorithm", type=str, default="fedavg", choices=supported_fl_algorithm)
 parser.add_argument("--client_frac", type=float, default=1.0)
+parser.add_argument("--hcfl_split_tol", type=float, default=0.35)
+parser.add_argument("--hcfl_min_cluster_size", type=int, default=2)
+parser.add_argument("--hcfl_warmup_rounds", type=int, default=5)
+parser.add_argument("--hcfl_max_clusters", type=int, default=8)
+parser.add_argument("--hcfl_proto_momentum", type=float, default=0.5)
 
 
 # simulation settings

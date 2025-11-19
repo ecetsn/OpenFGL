@@ -13,7 +13,7 @@ args.num_clients = 10
 
 
 if True:
-    args.fl_algorithm = "fedavg"
+    args.fl_algorithm = "hcfl_plus"
     args.model = ["gcn"]
 else:
     args.fl_algorithm = "fedproto"
