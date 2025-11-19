@@ -118,7 +118,7 @@ class FGLDataset(Dataset):
         Returns:
             Data: The data object for the client.
         """
-        data = torch.load(osp.join(self.processed_dir, "data_{}.pt".format(client_id)))
+        data = torch.load(osp.join(self.processed_dir, "data_{}.pt".format(client_id)), weights_only=False)
         if hasattr(data, "x"):
             data.x = data.x.to(torch.float32)
         if hasattr(data, "y"):
