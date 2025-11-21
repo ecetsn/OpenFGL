@@ -60,6 +60,22 @@ parser.add_argument("--num_clients", type=int, default=10)
 parser.add_argument("--num_rounds", type=int, default=100)
 parser.add_argument("--fl_algorithm", type=str, default="fedavg", choices=supported_fl_algorithm)
 parser.add_argument("--client_frac", type=float, default=1.0)
+<<<<<<< Updated upstream
+=======
+parser.add_argument("--hcfl_split_tol", type=float, default=0.35)
+parser.add_argument("--hcfl_min_cluster_size", type=int, default=2)
+parser.add_argument("--hcfl_warmup_rounds", type=int, default=5)
+parser.add_argument("--hcfl_max_clusters", type=int, default=8)
+parser.add_argument("--hcfl_proto_momentum", type=float, default=0.5)
+parser.add_argument("--hcfl_soft_temp", type=float, default=1.0, help="Temperature applied when computing soft responsibilities across clusters.")
+parser.add_argument("--hcfl_soft_temp_decay", type=float, default=1.0, help="Per-round multiplicative decay applied to temperature (e.g., 0.99 to anneal).")
+parser.add_argument("--hcfl_merge_tol", type=float, default=0.2, help="Distance threshold below which clusters are merged.")
+parser.add_argument("--hcfl_distance_mode", type=str, default="ascp", choices=["ascp", "cscp"], help="Distance metric variant: any-shift (ascp) or concept-shift-only (cscp).")
+parser.add_argument("--hcfl_mu", type=float, default=0.0, help="Regularization strength for aligning sample and client responsibilities (placeholder).")
+parser.add_argument("--hcfl_loss_importance", type=float, default=0.0, help="Scaling factor for incorporating per-cluster loss into distance metric.")
+parser.add_argument("--hcfl_head_layer_idx", type=int, default=-1, help="Index of the layer to treat as head when splitting encoder/head; -1 uses the last layer.")
+parser.add_argument("--hcfl_resp_topk", type=int, default=0, help="If >0, keep only top-k clusters per client for responsibilities (others zeroed then renormalized).")
+>>>>>>> Stashed changes
 
 
 # simulation settings
