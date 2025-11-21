@@ -13,19 +13,35 @@ class HCFLLUSClient(BaseClient):
 
     def __init__(self, args, client_id, data, data_dir, message_pool, device):
         super().__init__(args, client_id, data, data_dir, message_pool, device, personalized=True)
-        self.current_cluster = 0
+        self.current_cluster = 0##for single hard clusters
+        self.cluster_weights_i = None
+        self._prev_params = None
 
     def execute(self):
         """
         Pull the cluster-specific model from the server and run local training.
         """
-        server_payload = self.message_pool["server"]
-        self.current_cluster = server_payload["cluster_assignments"][self.client_id]
-        cluster_weight = server_payload["cluster_weights"][self.current_cluster]
+        server_payload = self.message_pool["server"]##added
+        cluster_models = server_payload["cluster_weights"]##added
 
-        with torch.no_grad():
+        membership = server_payload["client_membership"][self.client_id] ##added
+        ##self.current_cluster = server_payload["cluster_assignments"][self.client_id]
+        ##cluster_weight = server_payload["cluster_weights"][self.current_cluster]
+        self.cluster_weights_i = torch.as_tensor(membership, dtype=torch.float32, device=self.device)
+
+
+        '''with torch.no_grad():
             for local_param, cluster_param in zip(self.task.model.parameters(), cluster_weight):
                 local_param.data.copy_(cluster_param)
+        '''
+        with torch.no_grad():
+            for p_idx, local_param in enumerate(self.task.model.parameters()):
+                local_param.data.zero_()
+                for k, omega in enumerate(self.cluster_weights_i):
+                    cluster_param = cluster_models[k][p_idx].to(local_param.device)
+                    local_param.data.add_(omega * cluster_param.data)
+        
+        self._prev_params = [p.detach().clone() for p in self.task.model.parameters()]
 
         self.task.train()
 
@@ -35,12 +51,27 @@ class HCFLLUSClient(BaseClient):
         summarize the observed data distribution.
         """
         prototypes, counts = self._compute_prototypes()
+
+        deltas = []
+        with torch.no_grad():
+            for new_p, old_p in zip(self.task.model.parameters(), self._prev_params):
+                deltas.append(new_p.detach().clone() - old_p)
+                
+        '''
         self.message_pool[f"client_{self.client_id}"] = {
             "num_samples": self.task.num_samples,
             "weight": list(self.task.model.parameters()),
             "cluster_id": self.current_cluster,
             "prototypes": prototypes,
             "label_counts": counts,
+        }
+        '''
+        self.message_pool[f"client_{self.client_id}"] = {
+             "num_samples": self.task.num_samples,
+             "delta": deltas,
+             "membership": self.cluster_weights_i.cpu(),
+             "prototypes": prototypes,
+             "label_counts": counts,
         }
 
     def _compute_prototypes(self):

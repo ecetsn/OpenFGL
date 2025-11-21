@@ -60,11 +60,6 @@ parser.add_argument("--num_clients", type=int, default=10)
 parser.add_argument("--num_rounds", type=int, default=100)
 parser.add_argument("--fl_algorithm", type=str, default="fedavg", choices=supported_fl_algorithm)
 parser.add_argument("--client_frac", type=float, default=1.0)
-parser.add_argument("--hcfl_split_tol", type=float, default=0.35)
-parser.add_argument("--hcfl_min_cluster_size", type=int, default=2)
-parser.add_argument("--hcfl_warmup_rounds", type=int, default=5)
-parser.add_argument("--hcfl_max_clusters", type=int, default=8)
-parser.add_argument("--hcfl_proto_momentum", type=float, default=0.5)
 
 
 # simulation settings

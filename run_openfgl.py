@@ -11,7 +11,6 @@ args.dataset = ["Cora"]
 args.simulation_mode = "subgraph_fl_louvain"
 args.num_clients = 10
 
-
 if True:
     args.fl_algorithm = "hcfl_plus"
     args.model = ["gcn"]

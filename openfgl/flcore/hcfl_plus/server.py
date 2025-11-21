@@ -12,6 +12,9 @@ class HCFLLUSServer(BaseServer):
     def __init__(self, args, global_data, data_dir, message_pool, device):
         super().__init__(args, global_data, data_dir, message_pool, device, personalized=True)
         self.cluster_assignments = [0 for _ in range(self.args.num_clients)]
+        ##added
+        self.client_membership = [torch.tensor([1.0], dtype=torch.float32) for _ in range(self.args.num_clients)]
+
         self.cluster_weights = [self._clone_param_list(self.task.model.parameters())]
         self.prototype_cache = {cid: None for cid in range(self.args.num_clients)}
         self.label_hist_cache = {cid: None for cid in range(self.args.num_clients)}
@@ -27,6 +30,7 @@ class HCFLLUSServer(BaseServer):
         Aggregate updates from each cluster and refresh statistics used for
         similarity-driven clustering.
         """
+        '''
         sampled_clients = self.message_pool["sampled_clients"]
         clustered_clients = {}
         for cid in sampled_clients:
@@ -40,16 +44,51 @@ class HCFLLUSServer(BaseServer):
 
         self._maybe_split_clusters()
         self._synchronize_server_model()
+        '''
+        sampled_clients = self.message_pool["sampled_clients"]
+
+        for cid in sampled_clients:
+            msg = self.message_pool[f"client_{cid}"]
+            if "membership" in msg:
+                m = msg["membership"]
+                if not isinstance(m, torch.Tensor):
+                    m = torch.tensor(m, dtype=torch.float32)
+                
+                K = len(self.cluster_weights)
+                if m.numel() < K:
+                    pad = torch.zeros(K - m.numel(), dtype=torch.float32)
+                    m = torch.cat([m, pad], dim=0)
+                elif m.numel() > K:
+                    m = m[:K]
+            
+                self.client_membership[cid] = m
+
+        for cluster_id in range(len(self.cluster_weights)):
+            self.cluster_weights[cluster_id] = self._aggregate_cluster(cluster_id, sampled_clients)
+        
+        for cid in sampled_clients:
+             self._update_statistics(cid, self.message_pool[f"client_{cid}"])
+        
+        self._maybe_split_clusters()
+
+        self._synchronize_server_model()
+
 
     def send_message(self):
         """
         Distribute cluster-specific weights to all clients.
         """
+        
         cluster_payload = [
-            [param.detach().clone() for param in weights] for weights in self.cluster_weights
+        [param.detach().clone() for param in weights]
+        for weights in self.cluster_weights
         ]
+
+        membership_payload = [m.clone().cpu().tolist() for m in self.client_membership]
+        
         self.message_pool["server"] = {
             "cluster_weights": cluster_payload,
+            "client_membership": membership_payload,
             "cluster_assignments": self.cluster_assignments.copy(),
         }
 
@@ -57,6 +96,7 @@ class HCFLLUSServer(BaseServer):
         """
         Weighted averaging for a specific cluster.
         """
+        '''
         total_samples = sum(self.message_pool[f"client_{cid}"]["num_samples"] for cid in client_ids)
         if total_samples == 0:
             return [param.detach().clone() for param in self.cluster_weights[cluster_id]]
@@ -68,6 +108,32 @@ class HCFLLUSServer(BaseServer):
             for idx, param in enumerate(new_params):
                 param.data += weight * client_weight[idx].data
         return [param.detach().clone() for param in new_params]
+        '''
+        total_weight = 0.0
+        for cid in client_ids:
+            msg = self.message_pool[f"client_{cid}"]
+            n_i = msg["num_samples"]
+            w_i_k = float(self.client_membership[cid][cluster_id])
+            if w_i_k <= 0:
+                continue
+            total_weight += n_i * w_i_k
+        if total_weight == 0:
+            return [p.detach().clone() for p in self.cluster_weights[cluster_id]]
+        new_params = [p.detach().clone() for p in self.cluster_weights[cluster_id]]
+        eta_g = getattr(self.args, "hcfl_global_lr", 1.0)
+        
+        for cid in client_ids:
+            msg = self.message_pool[f"client_{cid}"]
+            deltas = msg["delta"]
+            n_i = msg["num_samples"]
+            w_i_k = float(self.client_membership[cid][cluster_id])
+            if w_i_k <= 0:
+                continue
+            coeff = (n_i * w_i_k) / total_weight
+            for pid, param in enumerate(new_params):
+              param.data += eta_g * coeff * deltas[pid].data
+        
+        return [p.detach().clone() for p in new_params]
 
     def _synchronize_server_model(self):
         """
@@ -174,9 +240,22 @@ class HCFLLUSServer(BaseServer):
         self.cluster_weights.append(new_weights)
         new_cluster_id = len(self.cluster_weights) - 1
 
+        for cid in range(self.args.num_clients):
+            m = self.client_membership[cid]
+            if m.numel() < len(self.cluster_weights):
+                zero = torch.zeros(1, dtype=m.dtype)
+                self.client_membership[cid] = torch.cat([m, zero], dim=0)
+            
+
         for cid in right_clients:
+            m = torch.zeros(len(self.cluster_weights), dtype=torch.float32)
+            m[new_cluster_id] = 1.0
+            self.client_membership[cid] = m
             self.cluster_assignments[cid] = new_cluster_id
         for cid in left_clients:
+            m = torch.zeros(len(self.cluster_weights), dtype=torch.float32)
+            m[cluster_id] = 1.0
+            self.client_membership[cid] = m
             self.cluster_assignments[cid] = cluster_id
 
     def _client_representation(self, client_id):
@@ -222,4 +301,3 @@ class HCFLLUSServer(BaseServer):
     @staticmethod
     def _clone_param_list(params):
         return [param.detach().clone() for param in params]
-
