@@ -1,5 +1,7 @@
 import warnings
 import torch
+from openfgl.utils.privacy_utils import gaussian_eps, compose_eps
+from openfgl.utils.secure_aggregation import mask_tensor
 from openfgl.flcore.base import BaseClient
 from openfgl.flcore.hcfl_plus.adapter import HCFLTaskAdapter
 from openfgl.flcore.hcfl_plus.utils import infer_phi_theta_indices
@@ -24,6 +26,11 @@ class HCFLLUSClient(BaseClient):
         self._prev_phi_params = None
         self._warned_stale_params = False
         self.delta_theta_per_cluster = None
+        self._dp_stats_logged = False
+        self._dp_membership_logged = False
+        self._dp_accounting_counts = {"stats": 0, "membership": 0, "sample": 0}
+        self._dp_accounting_logged = False
+        self._secure_agg_logged = False
 
     def execute(self):
         self.delta_theta_per_cluster = None
@@ -80,6 +87,28 @@ class HCFLLUSClient(BaseClient):
     def send_message(self):
         prototypes, counts = self._compute_prototypes()
 
+        membership = self.cluster_weights_i
+        if membership is not None and getattr(self.args, "hcfl_dp_membership", False):
+            if getattr(self.args, "debug", False) and not self._dp_membership_logged:
+                print(f"[hcfl_plus][client {self.client_id}] DP on membership enabled")
+                self._dp_membership_logged = True
+            membership = self._apply_dp_to_membership(membership)
+            if getattr(self.args, "hcfl_dp_accounting", False):
+                self._dp_accounting_counts["membership"] += 1
+
+        secure_masks = None
+        if getattr(self.args, "secure_agg_stats", False) and prototypes is not None and counts is not None:
+            if getattr(self.args, "debug", False) and not self._secure_agg_logged:
+                print(f"[hcfl_plus][client {self.client_id}] secure_agg_stats placeholder enabled")
+                self._secure_agg_logged = True
+            mask_scale = getattr(self.args, "secure_agg_mask_scale", 1.0)
+            masked_pc, mask_pc = mask_tensor(prototypes["P_c"], mask_scale=mask_scale)
+            masked_plf, mask_plf = mask_tensor(prototypes["P_lf"], mask_scale=mask_scale)
+            masked_counts, mask_counts = mask_tensor(counts, mask_scale=mask_scale)
+            prototypes = {"P_c": masked_pc, "P_lf": masked_plf}
+            counts = masked_counts
+            secure_masks = {"P_c": mask_pc, "P_lf": mask_plf, "counts": mask_counts}
+
         all_params = list(self.task.model.parameters())
         current_phi = [all_params[i] for i in self.phi_indices]
         if self._prev_phi_params is None:
@@ -103,10 +132,12 @@ class HCFLLUSClient(BaseClient):
             "num_samples": self.task.num_samples,
             "delta_phi": delta_phi,
             "delta_theta_per_cluster": delta_theta_per_cluster,
-            "membership": self.cluster_weights_i.cpu() if self.cluster_weights_i is not None else None,
+            "membership": membership.cpu() if membership is not None else None,
             "prototypes": prototypes,
             "label_counts": counts,
+            "secure_masks": secure_masks,
         }
+        self._log_dp_accounting()
 
     def _compute_prototypes(self):
         self.task.model.eval()
@@ -150,6 +181,14 @@ class HCFLLUSClient(BaseClient):
         else:
             proto_lf = torch.zeros(features.size(1), device=features.device, dtype=features.dtype)
 
+        if getattr(self.args, "hcfl_dp_stats", False):
+            if getattr(self.args, "debug", False) and not self._dp_stats_logged:
+                print(f"[hcfl_plus][client {self.client_id}] DP on prototypes/counts enabled")
+                self._dp_stats_logged = True
+            proto_c, proto_lf, counts = self._apply_dp_to_stats(proto_c, proto_lf, counts)
+            if getattr(self.args, "hcfl_dp_accounting", False):
+                self._dp_accounting_counts["stats"] += 1
+
         prototypes = {"P_c": proto_c.cpu(), "P_lf": proto_lf.cpu()}
         return prototypes, counts.cpu()
 
@@ -163,6 +202,90 @@ class HCFLLUSClient(BaseClient):
             mask = splitted["train_mask"]
         return labels.clone().detach(), mask.clone().detach()
 
+    def _apply_dp_to_stats(self, proto_c, proto_lf, counts):
+        proto_clip = getattr(self.args, "hcfl_proto_clip", 0.0)
+        proto_noise = getattr(self.args, "hcfl_proto_noise", 0.0)
+        count_clip = getattr(self.args, "hcfl_count_clip", 0.0)
+        count_noise = getattr(self.args, "hcfl_count_noise", 0.0)
+
+        if proto_clip > 0:
+            norms = proto_c.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+            scale = torch.clamp(proto_clip / norms, max=1.0)
+            proto_c = proto_c * scale
+            lf_norm = proto_lf.norm(p=2).clamp_min(1e-12)
+            lf_scale = min(1.0, proto_clip / float(lf_norm))
+            proto_lf = proto_lf * lf_scale
+
+        if proto_noise > 0:
+            proto_c = proto_c + torch.randn_like(proto_c) * proto_noise
+            proto_lf = proto_lf + torch.randn_like(proto_lf) * proto_noise
+
+        if count_clip > 0:
+            count_norm = counts.norm(p=2).clamp_min(1e-12)
+            count_scale = min(1.0, count_clip / float(count_norm))
+            counts = counts * count_scale
+
+        if count_noise > 0:
+            counts = counts + torch.randn_like(counts) * count_noise
+            counts = counts.clamp_min(0.0)
+
+        return proto_c, proto_lf, counts
+
+    def _apply_dp_to_membership(self, membership):
+        mem_clip = getattr(self.args, "hcfl_membership_clip", 0.0)
+        mem_noise = getattr(self.args, "hcfl_membership_noise", 0.0)
+
+        membership = membership.detach().clone()
+        if mem_clip > 0:
+            mem_norm = membership.norm(p=2).clamp_min(1e-12)
+            mem_scale = min(1.0, mem_clip / float(mem_norm))
+            membership = membership * mem_scale
+
+        if mem_noise > 0:
+            membership = membership + torch.randn_like(membership) * mem_noise
+
+        membership = membership.clamp_min(0.0)
+        total = membership.sum().clamp_min(1e-12)
+        membership = membership / total
+        return membership
+
+    def _log_dp_accounting(self):
+        if not getattr(self.args, "hcfl_dp_accounting", False):
+            return
+        if not getattr(self.args, "debug", False) or self._dp_accounting_logged:
+            return
+        delta = getattr(self.args, "dp_delta", 0.0)
+        info = []
+
+        if self._dp_accounting_counts["stats"] > 0:
+            proto_clip = getattr(self.args, "hcfl_proto_clip", 0.0)
+            proto_noise = getattr(self.args, "hcfl_proto_noise", 0.0)
+            count_clip = getattr(self.args, "hcfl_count_clip", 0.0)
+            count_noise = getattr(self.args, "hcfl_count_noise", 0.0)
+            eps_proto = compose_eps(gaussian_eps(proto_clip, proto_noise, delta), self._dp_accounting_counts["stats"])
+            eps_count = compose_eps(gaussian_eps(count_clip, count_noise, delta), self._dp_accounting_counts["stats"])
+            if eps_proto is not None:
+                info.append(f"eps_proto~{eps_proto:.4f}")
+            if eps_count is not None:
+                info.append(f"eps_count~{eps_count:.4f}")
+
+        if self._dp_accounting_counts["membership"] > 0:
+            mem_clip = getattr(self.args, "hcfl_membership_clip", 0.0)
+            mem_noise = getattr(self.args, "hcfl_membership_noise", 0.0)
+            eps_mem = compose_eps(gaussian_eps(mem_clip, mem_noise, delta), self._dp_accounting_counts["membership"])
+            if eps_mem is not None:
+                info.append(f"eps_membership~{eps_mem:.4f}")
+
+        if self._dp_accounting_counts["sample"] > 0:
+            sample_clip = getattr(self.args, "hcfl_sample_clip", 0.0)
+            sample_noise = getattr(self.args, "hcfl_sample_noise", 0.0)
+            eps_sample = compose_eps(gaussian_eps(sample_clip, sample_noise, delta), self._dp_accounting_counts["sample"])
+            if eps_sample is not None:
+                info.append(f"eps_sample~{eps_sample:.4f}")
+
+        if info:
+            print(f"[hcfl_plus][client {self.client_id}] DP accounting " + " ".join(info))
+            self._dp_accounting_logged = True
     def _prepare_theta_delta_payload(self):
         if self.delta_theta_per_cluster is None:
             return self._zero_theta_delta_payload()

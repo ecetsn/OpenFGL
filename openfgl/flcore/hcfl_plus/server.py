@@ -2,6 +2,7 @@ import torch
 from openfgl.flcore.base import BaseServer
 from openfgl.flcore.hcfl_plus.metrics import get_distance_metric
 from openfgl.flcore.hcfl_plus.utils import infer_phi_theta_indices
+from openfgl.utils.secure_aggregation import unmask_tensor
 
 
 class HCFLLUSServer(BaseServer):
@@ -60,6 +61,12 @@ class HCFLLUSServer(BaseServer):
 
                 self.client_membership[cid] = m
 
+            if getattr(self.args, "debug", False):
+                proto_info = msg.get("prototypes")
+                counts_info = msg.get("label_counts")
+                if proto_info is not None and counts_info is not None:
+                    self._log_dp_stats(cid, proto_info, counts_info)
+
         for cid in range(self.args.num_clients):
             membership = self.client_membership[cid]
             if isinstance(membership, torch.Tensor) and membership.numel() > 0:
@@ -76,6 +83,9 @@ class HCFLLUSServer(BaseServer):
         self._maybe_remove_clusters()
         self._maybe_merge_clusters()
         self._synchronize_server_model()
+
+        if getattr(self.args, "debug", False):
+            self._log_membership_stats(sampled_clients)
 
     def _aggregate_feature_extractor(self, client_ids):
         total_samples = sum(self.message_pool[f"client_{cid}"]["num_samples"] for cid in client_ids)
@@ -190,6 +200,8 @@ class HCFLLUSServer(BaseServer):
     def _update_statistics(self, client_id, message):
         prototypes_dict = message.get("prototypes")
         counts = message.get("label_counts")
+        if getattr(self.args, "secure_agg_stats", False):
+            prototypes_dict, counts = self._unmask_stats(client_id, prototypes_dict, counts, message.get("secure_masks"))
         if (
             prototypes_dict is None
             or counts is None
@@ -225,6 +237,57 @@ class HCFLLUSServer(BaseServer):
             self.label_hist_cache[client_id] = (
                 self.prototype_momentum * cached_counts + (1 - self.prototype_momentum) * counts
             )
+
+    def _unmask_stats(self, client_id, prototypes_dict, counts, masks):
+        if prototypes_dict is None or counts is None or masks is None:
+            return prototypes_dict, counts
+        try:
+            proto_c = unmask_tensor(prototypes_dict.get("P_c"), masks.get("P_c"))
+            proto_lf = unmask_tensor(prototypes_dict.get("P_lf"), masks.get("P_lf"))
+            counts = unmask_tensor(counts, masks.get("counts"))
+            return {"P_c": proto_c, "P_lf": proto_lf}, counts
+        except Exception:
+            if getattr(self.args, "debug", False):
+                print(f"[hcfl_plus][server] secure_agg_stats unmask failed for client {client_id}")
+            return prototypes_dict, counts
+
+    def _log_dp_stats(self, client_id, proto_info, counts_info):
+        proto_c = proto_info.get("P_c") if isinstance(proto_info, dict) else None
+        proto_lf = proto_info.get("P_lf") if isinstance(proto_info, dict) else None
+        counts = counts_info
+        if isinstance(counts, torch.Tensor):
+            counts = counts.to(torch.float32)
+        else:
+            counts = torch.tensor(counts, dtype=torch.float32)
+
+        info = []
+        if proto_c is not None:
+            proto_c = proto_c.to(torch.float32)
+            info.append(f"P_c_norm={proto_c.norm(p=2).item():.4f}")
+        if proto_lf is not None:
+            proto_lf = proto_lf.to(torch.float32)
+            info.append(f"P_lf_norm={proto_lf.norm(p=2).item():.4f}")
+        if counts is not None:
+            info.append(f"counts_sum={counts.sum().item():.4f}")
+
+        if info:
+            print(f"[hcfl_plus][server] stats recv client={client_id} " + " ".join(info))
+
+    def _log_membership_stats(self, sampled_clients):
+        if not sampled_clients:
+            return
+        mems = []
+        for cid in sampled_clients:
+            m = self.client_membership[cid]
+            if not isinstance(m, torch.Tensor):
+                m = torch.tensor(m, dtype=torch.float32)
+            mems.append(m)
+        if not mems:
+            return
+        mems = torch.stack(mems, dim=0)
+        avg_entropy = (-mems * (mems.clamp_min(1e-12).log())).sum(dim=1).mean().item()
+        avg_max = mems.max(dim=1).values.mean().item()
+        print(f"[hcfl_plus][server] membership avg_entropy={avg_entropy:.4f} avg_max={avg_max:.4f}")
 
     def _client_representation(self, client_id):
         proto_c = self.prototype_cache.get(client_id)

@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import math
 
 
 def clip_gradients(net: torch.nn.Module, loss_train: torch.Tensor, num_train: int, dp_mech: str, grad_clip: float):
@@ -61,3 +62,15 @@ def add_noise(args, net: torch.nn.Module, dataset_size: int):
                     param.data.add_(noise)
         else:
             raise NotImplementedError("This mechanism is not implemented!")
+
+
+def gaussian_eps(sensitivity: float, noise_std: float, delta: float):
+    if noise_std <= 0 or sensitivity <= 0 or delta <= 0:
+        return None
+    return sensitivity * math.sqrt(2 * math.log(1.25 / delta)) / noise_std
+
+
+def compose_eps(eps: float, steps: int):
+    if eps is None:
+        return None
+    return eps * max(1, int(steps))

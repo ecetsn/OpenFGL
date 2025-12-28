@@ -163,9 +163,17 @@ class HCFLTaskAdapter:
             gamma_tilde = (omega_tilde_expanded * L_k_t) / total_weighted_tilde.clamp_min(1e-12)
 
             omega_tilde_t_plus_1 = gamma_tilde.mean(dim=0)
+            entropy_reg = getattr(self.args, "hcfl_entropy_reg", 0.0)
+            if entropy_reg > 0:
+                uniform = torch.full_like(omega_tilde_t_plus_1, 1.0 / float(self.K))
+                omega_tilde_t_plus_1 = (1.0 - entropy_reg) * omega_tilde_t_plus_1 + entropy_reg * uniform
 
             tilde_mu = 1.0 / (1.0 + mu_N_factor)
             self.sample_weights_omega = tilde_mu * gamma + (1.0 - tilde_mu) * omega_tilde_t_plus_1
+            if getattr(self.args, "hcfl_dp_sample_weights", False):
+                self.sample_weights_omega = self._apply_dp_to_sample_weights(self.sample_weights_omega)
+                if getattr(self.args, "hcfl_dp_accounting", False):
+                    client_instance._dp_accounting_counts["sample"] += 1
 
             for k in range(self.K):
                 gamma_k = gamma[:, k]
@@ -191,6 +199,23 @@ class HCFLTaskAdapter:
             self._update_gaussian_params(features, last_gamma.to(features.device))
         client_instance.delta_theta_per_cluster = self._compute_theta_deltas(final_theta, server_theta_weights)
         client_instance.cluster_weights_i.data.copy_(omega_tilde_t_plus_1.cpu().data)
+
+    def _apply_dp_to_sample_weights(self, sample_weights):
+        clip = getattr(self.args, "hcfl_sample_clip", 0.0)
+        noise = getattr(self.args, "hcfl_sample_noise", 0.0)
+
+        weights = sample_weights.detach().clone()
+        if clip > 0:
+            norms = weights.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+            scale = torch.clamp(clip / norms, max=1.0)
+            weights = weights * scale
+
+        if noise > 0:
+            weights = weights + torch.randn_like(weights) * noise
+
+        weights = weights.clamp_min(0.0)
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        return weights
 
     def _update_theta_cluster(self, local_theta_params_k):
         theta_params = self._get_theta_params(self._get_current_model_params())
