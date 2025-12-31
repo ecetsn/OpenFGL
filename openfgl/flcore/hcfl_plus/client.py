@@ -4,6 +4,7 @@ from openfgl.utils.privacy_utils import gaussian_eps, compose_eps
 from openfgl.utils.secure_aggregation import mask_tensor
 from openfgl.flcore.base import BaseClient
 from openfgl.flcore.hcfl_plus.adapter import HCFLTaskAdapter
+from openfgl.flcore.hcfl_plus.graph_adapter import HCFLGraphTaskAdapter
 from openfgl.flcore.hcfl_plus.utils import infer_phi_theta_indices
 
 
@@ -21,7 +22,12 @@ class HCFLLUSClient(BaseClient):
         if not self.theta_indices:
             raise ValueError("HCFL+ could not determine predictor head indices.")
         self.args.num_head_layers = len(self.theta_indices)
-        self.task = HCFLTaskAdapter(self.task, self.phi_indices, self.theta_indices, self.args)
+        if getattr(self.args, "task", "") == "graph_cls":
+            self.task = HCFLGraphTaskAdapter(self.task, self.phi_indices, self.theta_indices, self.args)
+            self._is_graph_task = True
+        else:
+            self.task = HCFLTaskAdapter(self.task, self.phi_indices, self.theta_indices, self.args)
+            self._is_graph_task = False
 
         self._prev_phi_params = None
         self._warned_stale_params = False
@@ -140,6 +146,8 @@ class HCFLLUSClient(BaseClient):
         self._log_dp_accounting()
 
     def _compute_prototypes(self):
+        if self._is_graph_task:
+            return self._compute_graph_prototypes()
         self.task.model.eval()
         data = self.task.splitted_data["data"].to(self.device)
 
@@ -192,7 +200,56 @@ class HCFLLUSClient(BaseClient):
         prototypes = {"P_c": proto_c.cpu(), "P_lf": proto_lf.cpu()}
         return prototypes, counts.cpu()
 
+    def _compute_graph_prototypes(self):
+        self.task.model.eval()
+        train_loader = self.task.splitted_data["train_dataloader"]
+        num_classes = self.task.num_global_classes
+
+        proto_c = None
+        proto_lf_sum = None
+        counts = torch.zeros(num_classes, device=self.device, dtype=torch.float32)
+        total = 0
+
+        with torch.no_grad():
+            for batch in train_loader:
+                batch = batch.to(self.device)
+                features, _ = self.task.model(batch)
+                if features.dim() == 1:
+                    features = features.unsqueeze(-1)
+                labels = batch.y.long()
+                if proto_c is None:
+                    proto_c = torch.zeros(num_classes, features.size(1), device=self.device, dtype=features.dtype)
+                    proto_lf_sum = torch.zeros(features.size(1), device=self.device, dtype=features.dtype)
+
+                ones = torch.ones(labels.shape[0], device=self.device, dtype=features.dtype)
+                proto_c.index_add_(0, labels, features)
+                counts.index_add_(0, labels, ones)
+                proto_lf_sum += features.sum(dim=0)
+                total += labels.shape[0]
+
+        if proto_c is None:
+            return None, None
+
+        proto_c = proto_c / counts.clamp_min(1.0).unsqueeze(1)
+        proto_lf = proto_lf_sum / max(1, total)
+
+        if getattr(self.args, "hcfl_dp_stats", False):
+            if getattr(self.args, "debug", False) and not self._dp_stats_logged:
+                print(f"[hcfl_plus][client {self.client_id}] DP on prototypes/counts enabled")
+                self._dp_stats_logged = True
+            proto_c, proto_lf, counts = self._apply_dp_to_stats(proto_c, proto_lf, counts)
+            if getattr(self.args, "hcfl_dp_accounting", False):
+                self._dp_accounting_counts["stats"] += 1
+
+        prototypes = {"P_c": proto_c.cpu(), "P_lf": proto_lf.cpu()}
+        return prototypes, counts.cpu()
+
     def _get_train_labels_and_mask(self):
+        """Get training labels and mask for node-level tasks.
+
+        Note: For graph classification tasks, labels are handled directly
+        in _compute_graph_prototypes() and HCFLGraphTaskAdapter.train().
+        """
         splitted = self.task.splitted_data
         if "merged_edge_label" in splitted:
             labels = splitted["merged_edge_label"]

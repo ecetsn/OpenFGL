@@ -1,12 +1,12 @@
 import torch
 import torch.nn.functional as F
-from openfgl.flcore.hcfl_plus.likelihoods import get_likelihood_strategy
+from openfgl.flcore.hcfl_plus.likelihoods import _gaussian_log_density
 from openfgl.utils.privacy_utils import clip_gradients, add_noise
 
 
-class HCFLTaskAdapter:
+class HCFLGraphTaskAdapter:
     """
-    Adapter that wraps a BaseTask to run the HCFL+ EM-style local training.
+    Graph-classification HCFL+ adapter with EM-style local training on graph batches.
     """
 
     def __init__(self, original_task, phi_indices, theta_indices, args):
@@ -19,7 +19,7 @@ class HCFLTaskAdapter:
         self.K = getattr(args, "num_clusters", 1)
         self.sample_weights_omega = None
         self.cluster_gaussians = []
-        self.likelihood_strategy = get_likelihood_strategy(self.args)
+        self._cached_num_samples = None  # Cache to avoid repeated dataloader iteration
         self._initialize_hcfl_optimizer()
 
     def __getattr__(self, name):
@@ -54,8 +54,8 @@ class HCFLTaskAdapter:
                 param_idx = self.theta_indices[local_idx]
                 all_params[param_idx].data.copy_(theta_param.data)
 
-    def _forward_with_features(self, data):
-        model_output = self.model(data)
+    def _forward_with_features(self, batch):
+        model_output = self.model(batch)
         if isinstance(model_output, tuple):
             if len(model_output) >= 2:
                 features, logits = model_output[0], model_output[1]
@@ -101,39 +101,54 @@ class HCFLTaskAdapter:
             self.cluster_gaussians[k]["mu"] = mu.detach().clone()
             self.cluster_gaussians[k]["sigma"] = var.detach().clone().clamp_min(eps)
 
-    def _calculate_all_cluster_likelihoods(self, data, y, server_theta_weights, cluster_label_dists=None):
-        strategy = self.likelihood_strategy
-        if strategy is None:
-            strategy = get_likelihood_strategy(self.args)
-            self.likelihood_strategy = strategy
-        if cluster_label_dists is not None and not isinstance(cluster_label_dists, torch.Tensor):
-            cluster_label_dists = torch.tensor(cluster_label_dists, dtype=torch.float32, device=self.device)
+    def _calculate_all_cluster_likelihoods(self, train_loader, server_theta_weights, cluster_label_dists=None):
+        formulation = getattr(self.args, "hcfl_formulation", "conditional").lower()
         gaussian_params = self.cluster_gaussians
         global_prior = None
         if cluster_label_dists is not None:
+            if not isinstance(cluster_label_dists, torch.Tensor):
+                cluster_label_dists = torch.tensor(cluster_label_dists, dtype=torch.float32, device=self.device)
             if cluster_label_dists.dim() == 1:
                 prior = cluster_label_dists.clone()
             else:
                 prior = cluster_label_dists.sum(dim=0)
             total = prior.sum().clamp_min(1e-6)
-            global_prior = (prior / total).to(y.device)
-        return strategy.compute(
-            self,
-            data,
-            y,
-            server_theta_weights,
-            cluster_label_dists=cluster_label_dists,
-            gaussian_params=gaussian_params,
-            global_label_prior=global_prior,
-        )
+            global_prior = (prior / total).to(self.device)
+
+        num_samples = self._infer_num_samples()
+        K = len(server_theta_weights)
+        L_k_t = torch.zeros(num_samples, K, device=self.device)
+
+        for k in range(K):
+            self._set_theta_params(server_theta_weights[k])
+            offset = 0
+            for batch in train_loader:
+                batch = batch.to(self.device)
+                features, logits = self._forward_with_features(batch)
+                labels = batch.y.long()
+                idx = torch.arange(labels.shape[0], device=self.device)
+                log_p = F.log_softmax(logits, dim=1)
+                log_L_k = log_p[idx, labels]
+
+                if formulation in ("joint", "correlation"):
+                    if gaussian_params is not None and k < len(gaussian_params):
+                        params = gaussian_params[k]
+                        if params is not None:
+                            log_L_k = log_L_k + _gaussian_log_density(features, params)
+                if formulation == "correlation" and global_prior is not None:
+                    log_L_k = log_L_k - torch.log(global_prior[labels].clamp_min(1e-6))
+
+                L_batch = torch.exp(log_L_k)
+                L_k_t[offset : offset + labels.shape[0], k] = L_batch
+                offset += labels.shape[0]
+
+        return L_k_t
 
     def train(self, client_instance, server_theta_weights, cluster_label_dists=None, *args, **kwargs):
         self.model.train()
         omega_tilde_t = client_instance.cluster_weights_i.to(self.device)
-        data = self.splitted_data["data"].to(self.device)
-        labels, _ = client_instance._get_train_labels_and_mask()
-        labels = labels.to(self.device).long()
-        N_i = self._infer_num_samples(data)
+        train_loader = self.splitted_data["train_dataloader"]
+        N_i = self._infer_num_samples()
         if N_i == 0:
             return
 
@@ -153,7 +168,7 @@ class HCFLTaskAdapter:
         for _ in range(self.args.num_epochs):
             self.optimizer.zero_grad()
             L_k_t = self._calculate_all_cluster_likelihoods(
-                data, labels, local_theta_params, cluster_label_dists=cluster_label_dists
+                train_loader, local_theta_params, cluster_label_dists=cluster_label_dists
             )
             total_weighted = (self.sample_weights_omega * L_k_t).sum(dim=1, keepdim=True)
             gamma = (self.sample_weights_omega * L_k_t) / total_weighted.clamp_min(1e-12)
@@ -176,7 +191,7 @@ class HCFLTaskAdapter:
                 if getattr(self.args, "hcfl_dp_accounting", False):
                     client_instance._dp_accounting_counts["sample"] += 1
 
-            # For DP mode, accumulate clipped phi gradients across clusters
+            # For DP mode, accumulate clipped phi gradients across clusters and batches
             dp_enabled = getattr(self.args, "dp_mech", "no_dp") != "no_dp"
             if dp_enabled:
                 phi_grad_accum = {
@@ -191,27 +206,35 @@ class HCFLTaskAdapter:
                     continue
 
                 self._set_theta_params(local_theta_params[k])
-                _, logits = self.model(data)
-                sample_losses = F.cross_entropy(logits, labels, reduction="none")
-                weighted_losses = gamma_k * sample_losses  # Per-sample weighted losses
+                offset = 0
+                for batch in train_loader:
+                    batch = batch.to(self.device)
+                    _, logits = self.model(batch)
+                    labels = batch.y.long()
+                    sample_losses = F.cross_entropy(logits, labels, reduction="none")
+                    weights = gamma_k[offset : offset + labels.shape[0]]
+                    weighted_losses = weights * sample_losses  # Per-sample weighted losses
+                    batch_size = labels.shape[0]
 
-                # Model-level DP: clip per-sample gradients if DP enabled
-                if dp_enabled:
-                    clip_gradients(
-                        self.model,
-                        weighted_losses,
-                        N_i,
-                        self.args.dp_mech,
-                        getattr(self.args, "grad_clip", 1.0),
-                    )
-                    # Accumulate clipped phi gradients
-                    all_params = list(self.model.parameters())
-                    for i in self.phi_indices:
-                        if all_params[i].grad is not None:
-                            phi_grad_accum[i].add_(all_params[i].grad.data)
-                else:
-                    loss_k = weighted_losses.sum()
-                    loss_k.backward()
+                    # Model-level DP: clip per-sample gradients if DP enabled
+                    if dp_enabled:
+                        clip_gradients(
+                            self.model,
+                            weighted_losses,
+                            batch_size,
+                            self.args.dp_mech,
+                            getattr(self.args, "grad_clip", 1.0),
+                        )
+                        # Accumulate clipped phi gradients
+                        all_params = list(self.model.parameters())
+                        for i in self.phi_indices:
+                            if all_params[i].grad is not None:
+                                phi_grad_accum[i].add_(all_params[i].grad.data)
+                    else:
+                        loss_k = weighted_losses.sum()
+                        loss_k.backward()
+                    offset += batch_size
+
                 self._update_theta_cluster(local_theta_params[k])
 
             # Restore accumulated phi gradients for optimizer.step()
@@ -224,17 +247,27 @@ class HCFLTaskAdapter:
             self.optimizer.step()
 
             # Model-level DP: add noise to model parameters after update
-            if getattr(self.args, "dp_mech", "no_dp") != "no_dp":
+            if dp_enabled:
                 add_noise(self.args, self.model, N_i)
 
         final_theta = [self._clone_param_list(theta) for theta in local_theta_params]
         weighted_theta = self._compute_weighted_theta(final_theta, omega_tilde_t_plus_1)
         self._set_theta_params(weighted_theta)
         if last_gamma is not None:
-            features, _ = self._forward_with_features(data)
+            features = self._collect_features(train_loader)
             self._update_gaussian_params(features, last_gamma.to(features.device))
         client_instance.delta_theta_per_cluster = self._compute_theta_deltas(final_theta, server_theta_weights)
         client_instance.cluster_weights_i.data.copy_(omega_tilde_t_plus_1.cpu().data)
+
+    def _collect_features(self, train_loader):
+        features_all = []
+        for batch in train_loader:
+            batch = batch.to(self.device)
+            features, _ = self._forward_with_features(batch)
+            features_all.append(features)
+        if not features_all:
+            return None
+        return torch.cat(features_all, dim=0)
 
     def _apply_dp_to_sample_weights(self, sample_weights):
         clip = getattr(self.args, "hcfl_sample_clip", 0.0)
@@ -291,14 +324,44 @@ class HCFLTaskAdapter:
             deltas.append(cluster_delta)
         return deltas
 
-    def _infer_num_samples(self, data):
-        if hasattr(data, "num_nodes"):
-            return data.num_nodes
-        if hasattr(data, "x"):
-            return data.x.shape[0]
-        if hasattr(data, "num_graphs"):
-            return data.num_graphs
-        return self._task.num_samples
+    def _infer_num_samples(self):
+        """Infer number of training samples for graph classification.
+
+        For graph-FL, this counts training graphs from the dataloader.
+        Falls back to train_mask if dataloader is unavailable.
+        Results are cached to avoid repeated iteration.
+        """
+        if self._cached_num_samples is not None:
+            return self._cached_num_samples
+
+        train_loader = self.splitted_data.get("train_dataloader")
+        if train_loader is not None:
+            # Try to get length from dataset first (efficient)
+            if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "__len__"):
+                self._cached_num_samples = len(train_loader.dataset)
+                return self._cached_num_samples
+
+            # Otherwise iterate to count
+            total = 0
+            for batch in train_loader:
+                if hasattr(batch, "num_graphs"):
+                    total += batch.num_graphs
+                elif hasattr(batch, "y"):
+                    total += batch.y.shape[0]
+                else:
+                    total += 1
+            self._cached_num_samples = total
+            return total
+
+        # Fallback to train_mask (for subgraph-FL compatibility)
+        train_mask = self.splitted_data.get("train_mask")
+        if train_mask is None:
+            return 0
+        if isinstance(train_mask, torch.Tensor):
+            self._cached_num_samples = int(train_mask.sum().item())
+        else:
+            self._cached_num_samples = int(sum(train_mask))
+        return self._cached_num_samples
 
     def _apply_optimizer_callback(self):
         if not getattr(self.args, "hcfl_freeze_phi", False):
