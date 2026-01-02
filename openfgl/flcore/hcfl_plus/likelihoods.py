@@ -19,7 +19,7 @@ class ConditionalLikelihood(ClusterLikelihood):
     """
 
     def compute(self, adapter, data, labels, server_theta_weights, **kwargs):
-        return _compute_likelihood(adapter, data, labels, server_theta_weights)
+        return _compute_likelihood(adapter, data, labels, server_theta_weights, mask=kwargs.get("mask"))
 
 
 class JointLikelihood(ClusterLikelihood):
@@ -35,6 +35,7 @@ class JointLikelihood(ClusterLikelihood):
             labels,
             server_theta_weights,
             gaussian_params=gaussian_params,
+            mask=kwargs.get("mask"),
         )
 
 
@@ -53,6 +54,7 @@ class CorrelationLikelihood(ClusterLikelihood):
             server_theta_weights,
             gaussian_params=gaussian_params,
             global_label_prior=global_label_prior,
+            mask=kwargs.get("mask"),
         )
 
 
@@ -63,9 +65,15 @@ def _compute_likelihood(
     server_theta_weights,
     gaussian_params=None,
     global_label_prior=None,
+    mask=None,
 ):
     device = labels.device
-    N_i = labels.shape[0]
+    if mask is not None:
+        mask = mask.to(device).bool()
+        labels_eval = labels[mask]
+    else:
+        labels_eval = labels
+    N_i = labels_eval.shape[0]
     K = len(server_theta_weights)
     likelihoods = torch.zeros(N_i, K, device=device)
 
@@ -76,10 +84,13 @@ def _compute_likelihood(
         for k in range(K):
             adapter._set_theta_params(server_theta_weights[k])
             features, logits = adapter._forward_with_features(data)
+            if mask is not None:
+                features = features[mask]
+                logits = logits[mask]
             logits = logits.to(device)
             log_p = F.log_softmax(logits, dim=1)
             idx = torch.arange(N_i, device=device)
-            log_L_k = log_p[idx, labels]
+            log_L_k = log_p[idx, labels_eval]
 
             if gaussian_params is not None and k < len(gaussian_params):
                 params = gaussian_params[k]
@@ -88,7 +99,7 @@ def _compute_likelihood(
                     log_L_k = log_L_k + log_px
 
             if global_label_prior is not None:
-                log_py = torch.log(global_label_prior[labels].clamp_min(1e-6))
+                log_py = torch.log(global_label_prior[labels_eval].clamp_min(1e-6))
                 log_L_k = log_L_k - log_py
 
             likelihoods[:, k] = torch.exp(log_L_k)

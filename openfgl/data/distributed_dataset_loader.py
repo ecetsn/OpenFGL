@@ -205,7 +205,8 @@ class FGLDataset(Dataset):
             if self.args.scenario == "graph_fl":
                 self.global_data = global_dataset
             else:
-                self.global_data = global_dataset.data
+                # Use the first graph instead of internal .data to avoid PyG warnings.
+                self.global_data = global_dataset[0]
                 if hasattr(self.global_data, "x"):
                     self.global_data.x = self.global_data.x.to(torch.float32)
                 if hasattr(self.global_data, "y"):

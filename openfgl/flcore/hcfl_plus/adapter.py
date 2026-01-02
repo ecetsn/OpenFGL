@@ -101,7 +101,7 @@ class HCFLTaskAdapter:
             self.cluster_gaussians[k]["mu"] = mu.detach().clone()
             self.cluster_gaussians[k]["sigma"] = var.detach().clone().clamp_min(eps)
 
-    def _calculate_all_cluster_likelihoods(self, data, y, server_theta_weights, cluster_label_dists=None):
+    def _calculate_all_cluster_likelihoods(self, data, y, server_theta_weights, cluster_label_dists=None, mask=None):
         strategy = self.likelihood_strategy
         if strategy is None:
             strategy = get_likelihood_strategy(self.args)
@@ -110,6 +110,8 @@ class HCFLTaskAdapter:
             cluster_label_dists = torch.tensor(cluster_label_dists, dtype=torch.float32, device=self.device)
         gaussian_params = self.cluster_gaussians
         global_prior = None
+        if mask is not None:
+            mask = mask.to(self.device).bool()
         if cluster_label_dists is not None:
             if cluster_label_dists.dim() == 1:
                 prior = cluster_label_dists.clone()
@@ -125,15 +127,17 @@ class HCFLTaskAdapter:
             cluster_label_dists=cluster_label_dists,
             gaussian_params=gaussian_params,
             global_label_prior=global_prior,
+            mask=mask,
         )
 
     def train(self, client_instance, server_theta_weights, cluster_label_dists=None, *args, **kwargs):
         self.model.train()
         omega_tilde_t = client_instance.cluster_weights_i.to(self.device)
         data = self.splitted_data["data"].to(self.device)
-        labels, _ = client_instance._get_train_labels_and_mask()
+        labels, train_mask = client_instance._get_train_labels_and_mask()
         labels = labels.to(self.device).long()
-        N_i = self._infer_num_samples(data)
+        train_mask = train_mask.to(self.device).bool()
+        N_i = self._infer_num_samples(data, mask=train_mask)
         if N_i == 0:
             return
 
@@ -153,7 +157,7 @@ class HCFLTaskAdapter:
         for _ in range(self.args.num_epochs):
             self.optimizer.zero_grad()
             L_k_t = self._calculate_all_cluster_likelihoods(
-                data, labels, local_theta_params, cluster_label_dists=cluster_label_dists
+                data, labels, local_theta_params, cluster_label_dists=cluster_label_dists, mask=train_mask
             )
             total_weighted = (self.sample_weights_omega * L_k_t).sum(dim=1, keepdim=True)
             gamma = (self.sample_weights_omega * L_k_t) / total_weighted.clamp_min(1e-12)
@@ -192,7 +196,9 @@ class HCFLTaskAdapter:
 
                 self._set_theta_params(local_theta_params[k])
                 _, logits = self.model(data)
-                sample_losses = F.cross_entropy(logits, labels, reduction="none")
+                logits = logits[train_mask]
+                labels_masked = labels[train_mask]
+                sample_losses = F.cross_entropy(logits, labels_masked, reduction="none")
                 weighted_losses = gamma_k * sample_losses  # Per-sample weighted losses
 
                 # Model-level DP: clip per-sample gradients if DP enabled
@@ -232,6 +238,7 @@ class HCFLTaskAdapter:
         self._set_theta_params(weighted_theta)
         if last_gamma is not None:
             features, _ = self._forward_with_features(data)
+            features = features[train_mask]
             self._update_gaussian_params(features, last_gamma.to(features.device))
         client_instance.delta_theta_per_cluster = self._compute_theta_deltas(final_theta, server_theta_weights)
         client_instance.cluster_weights_i.data.copy_(omega_tilde_t_plus_1.cpu().data)
@@ -291,7 +298,11 @@ class HCFLTaskAdapter:
             deltas.append(cluster_delta)
         return deltas
 
-    def _infer_num_samples(self, data):
+    def _infer_num_samples(self, data, mask=None):
+        if mask is not None:
+            if isinstance(mask, torch.Tensor):
+                return int(mask.to(dtype=torch.float32).sum().item())
+            return int(sum(mask))
         if hasattr(data, "num_nodes"):
             return data.num_nodes
         if hasattr(data, "x"):
